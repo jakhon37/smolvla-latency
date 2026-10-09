@@ -1,0 +1,10 @@
+# Reference pins; scripts/setup_env.sh installs these into a Python 3.12 venv.
+torch==2.11.*            # from https://download.pytorch.org/whl/cu128
+torchvision==0.26.*
+lerobot[smolvla]==0.6.1  # transformers>=5.4,<5.6
+onnx
+onnxscript
+onnxruntime
+matplotlib
+tensorrt-cu12==10.16.*   # GPU machines only; --extra-index-url https://pypi.nvidia.com
+mujoco                   # env_check rendering test only

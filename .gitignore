@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+onnx/
+*.onnx
+*.onnx.data
+*.engine
+results/*/onnx/*.npz
