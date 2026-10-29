@@ -32,7 +32,9 @@ pip_in() { VIRTUAL_ENV="$VENV" uv pip install "$@"; }
 
 # torch first from the CUDA index; LeRobot's own torch pin (>=2.7,<2.12) is then already satisfied.
 pip_in "torch==2.11.*" "torchvision==0.26.*" --index-url "$TORCH_INDEX"
-pip_in "lerobot[smolvla]==0.6.1" onnx onnxscript onnxruntime matplotlib
+# onnxruntime matches the C++ SDK of cpp/scripts/fetch_onnxruntime.sh: the tests expect identical chunks from both.
+# pytest runs the tests; pybind11 builds the C++ runtime's Python module.
+pip_in "lerobot[smolvla]==0.6.1" onnx onnxscript "onnxruntime==1.31.0" matplotlib "pytest==9.*" "pybind11==3.1.*"
 if [ -n "$DRIVER" ] && [ "${WITH_TRT:-1}" = 1 ]; then
   # The PyPI tensorrt-*-libs packages are stubs that fetch the real wheels from pypi.nvidia.com.
   # TensorRT 11 removed the weakly typed FP16 flag; trt_vision.py's default mode works on 10 and 11.

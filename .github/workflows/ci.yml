@@ -1,0 +1,41 @@
+# Offline tests on a CPU runner: tiny random models built on the fly. No GPU, no Hugging Face Hub, no secrets.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      HF_HUB_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Python 3.12 environment in ~/venvs/smolvla (CPU torch, LeRobot 0.6.1)
+        env:
+          TORCH_INDEX: https://download.pytorch.org/whl/cpu
+          WITH_TRT: "0"
+          WITH_MUJOCO: "0"
+        run: |
+          bash scripts/setup_env.sh
+          "$HOME/venvs/smolvla/bin/python" -c "import torch; assert torch.version.cuda is None, torch.__version__"
+
+      - name: Python tests
+        run: |
+          "$HOME/venvs/smolvla/bin/python" -m pytest tests -q
+
+      - name: Smoke test
+        run: |
+          bash tests/smoke_test.sh "$HOME/venvs/smolvla/bin/python"
+
+      - name: C++ runtime build, unit tests and parity against PyTorch
+        run: |
+          bash tests/cpp_parity.sh "$HOME/venvs/smolvla/bin/python"

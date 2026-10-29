@@ -42,6 +42,28 @@ def inspect_checkpoint(path: str, revision: str | None = None) -> dict:
     return {"file": f, "n_tensors": len(keys), "stored_dtypes": {g: dict(c) for g, c in by_group.items()}, "keys": keys}
 
 
+def load_config(path: str, device: str, revision: str | None = None):
+    cfg = PreTrainedConfig.from_pretrained(path, revision=revision)
+    if cfg.type != "smolvla":
+        raise ValueError(f"{path} is a '{cfg.type}' policy; this tool only handles smolvla")
+    cfg.device = device
+    return cfg
+
+
+def load_processors(cfg, path: str, device: str, revision: str | None = None, language_padding: str | None = None):
+    """The checkpoint's pre/post-processors. ``language_padding="max_length"`` pads the task to
+    ``tokenizer_max_length`` instead of the saved ``pad_language_to`` (usually "longest")."""
+    overrides = {"device_processor": {"device": device}}
+    if language_padding is not None:
+        overrides["tokenizer_processor"] = {"padding": language_padding}
+    return make_pre_post_processors(
+        cfg,
+        pretrained_path=path,
+        pretrained_revision=revision,
+        preprocessor_overrides=overrides,
+    )
+
+
 def load_policy(path: str, device: str, revision: str | None = None):
     """Build SmolVLA with every parameter in fp32, then copy the checkpoint in.
 
@@ -50,12 +72,9 @@ def load_policy(path: str, device: str, revision: str | None = None):
     the reference holds the stored values exactly even if the base VLM's config carries a
     bf16 dtype. The dtypes the constructor produced are reported as ``built_dtypes``.
     """
-    cfg = PreTrainedConfig.from_pretrained(path, revision=revision)
-    if cfg.type != "smolvla":
-        raise ValueError(f"{path} is a '{cfg.type}' policy; this tool only handles smolvla")
+    cfg = load_config(path, device, revision)
     saved_flag = bool(cfg.load_vlm_weights)
     cfg.load_vlm_weights = False
-    cfg.device = device
 
     policy = SmolVLAPolicy(cfg)
     built = dtype_report(policy)
@@ -74,12 +93,7 @@ def load_policy(path: str, device: str, revision: str | None = None):
         unexpected_in_checkpoint=sorted(unexpected),
     )
 
-    pre, post = make_pre_post_processors(
-        cfg,
-        pretrained_path=path,
-        pretrained_revision=revision,
-        preprocessor_overrides={"device_processor": {"device": device}},
-    )
+    pre, post = load_processors(cfg, path, device, revision)
     return policy, pre, post, info
 
 

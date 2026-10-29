@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 
 from smolvla_latency import sysinfo
 from smolvla_latency.loading import load_policy
@@ -48,13 +49,22 @@ def export(module, example, path: Path, opset: int, dynamo: bool) -> dict:
             "mb": round(sum(p.stat().st_size for p in files) / 2**20, 1), "dynamo": dynamo, "opset": opset}
 
 
+def ort_providers(device: str) -> list:
+    """ONNX Runtime providers for a parity check on ``device``: CUDA if asked for and available, else the CPU.
+
+    The CUDA provider runs fp32 MatMul and Conv in TF32 unless told otherwise, and the reference is strict fp32.
+    """
+    import onnxruntime as ort
+
+    if device == "cuda" and "CUDAExecutionProvider" in ort.get_available_providers():
+        return [("CUDAExecutionProvider", {"use_tf32": "0"}), "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
+
+
 def ort_run(path: Path, x: np.ndarray, device: str) -> tuple[np.ndarray, str]:
     import onnxruntime as ort
 
-    providers = ["CPUExecutionProvider"]
-    if device == "cuda" and "CUDAExecutionProvider" in ort.get_available_providers():
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    sess = ort.InferenceSession(str(path), providers=providers)
+    sess = ort.InferenceSession(str(path), providers=ort_providers(device))
     feed = {sess.get_inputs()[0].name: x}
     outs = [sess.run(None, {k: v[i:i + 1] for k, v in feed.items()})[0] for i in range(x.shape[0])]
     return np.concatenate(outs), sess.get_providers()[0]
@@ -67,10 +77,16 @@ def main() -> None:
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out-dir", type=Path, default=Path("onnx"))
     ap.add_argument("--opset", type=int, default=18)
-    ap.add_argument("--legacy-exporter", action="store_true", help="use the TorchScript exporter (dynamo=False)")
+    ap.add_argument("--legacy-exporter", action="store_true",
+                    help="use the TorchScript exporter (dynamo=False); it fails under transformers 5, which "
+                         "LeRobot 0.6.1 requires")
     ap.add_argument("--num-check", type=int, default=16, help="random inputs used for parity")
     ap.add_argument("--skip-fp16", action="store_true")
     args = ap.parse_args()
+    if args.legacy_exporter and int(transformers.__version__.split(".")[0]) >= 5:
+        raise SystemExit(f"--legacy-exporter: the TorchScript exporter fails under transformers "
+                         f"{transformers.__version__}, inside SmolVLM's vision attention mask (IndexError in "
+                         "transformers.masking_utils.sdpa_mask). Use the default exporter, dynamo=True.")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # Strict fp32 reference: cuDNN convs (the SigLIP patch embedding) default to TF32 on Ampere+.

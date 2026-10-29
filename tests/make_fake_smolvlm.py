@@ -5,8 +5,11 @@ Weights are random and the tokenizer is a toy BPE, so any timing or accuracy
 from it is meaningless. Layer sizes approximate the real 500M model so that
 shapes, exports and code paths match.
 
-    python tests/make_fake_smolvlm.py /tmp/fake-smolvlm [--tiny] [--weights] [--config-dtype bfloat16]
+    python tests/make_fake_smolvlm.py /tmp/fake-smolvlm [--tiny] [--kv-heads N] [--weights] [--config-dtype bfloat16]
 
+--kv-heads gives the text model N key/value heads with three query heads each, SmolVLM2's ratio (it has 5 and 15;
+--tiny has 1 and 3). The split-graph tests use --tiny --kv-heads 2: with a single key/value head, K/V read in the
+wrong memory layout ([seq, heads] for [heads, seq]) are the same numbers, so a layout bug would go unnoticed.
 --weights also saves random VLM weights, so LeRobot's own load_vlm_weights=true path can run.
 --config-dtype writes a torch_dtype into the config, as hub configs usually carry one.
 """
@@ -39,7 +42,8 @@ CORPUS = [
 ] * 50
 
 
-def build(out: Path, tiny: bool, weights: bool = False, config_dtype: str | None = None) -> None:
+def build(out: Path, tiny: bool, weights: bool = False, config_dtype: str | None = None,
+          kv_heads: int | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     tok = Tokenizer(models.BPE(unk_token="<unk>"))
@@ -79,6 +83,8 @@ def build(out: Path, tiny: bool, weights: bool = False, config_dtype: str | None
         text.update(num_hidden_layers=4, hidden_size=192, intermediate_size=512, num_attention_heads=3,
                     num_key_value_heads=1)
         vision.update(num_hidden_layers=2, hidden_size=192, intermediate_size=384, num_attention_heads=3)
+    if kv_heads:
+        text.update(num_key_value_heads=kv_heads, num_attention_heads=3 * kv_heads)
 
     config = SmolVLMConfig(
         text_config=text,
@@ -101,14 +107,17 @@ def build(out: Path, tiny: bool, weights: bool = False, config_dtype: str | None
         image_seq_len=64,
     )
     processor.save_pretrained(out)
-    print(f"fake SmolVLM written to {out} (tiny={tiny}, weights={weights}, config_dtype={config_dtype})")
+    print(f"fake SmolVLM written to {out} (tiny={tiny}, kv_heads={text['num_key_value_heads']}, weights={weights}, "
+          f"config_dtype={config_dtype})")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("out", type=Path)
     p.add_argument("--tiny", action="store_true", help="2-4 layers, for fast CI")
+    p.add_argument("--kv-heads", type=int, default=None,
+                   help="key/value heads, each with three query heads (default 5, or 1 with --tiny)")
     p.add_argument("--weights", action="store_true", help="also save random weights")
     p.add_argument("--config-dtype", default=None, help="e.g. bfloat16")
     a = p.parse_args()
-    build(a.out, a.tiny, a.weights, a.config_dtype)
+    build(a.out, a.tiny, a.weights, a.config_dtype, a.kv_heads)

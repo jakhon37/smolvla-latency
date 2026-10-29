@@ -2,7 +2,11 @@ __pycache__/
 *.pyc
 .venv/
 onnx/
+onnx_split/
+bundle.bin
 *.onnx
 *.onnx.data
 *.engine
 results/*/onnx/*.npz
+cpp/build*/
+cpp/third_party/

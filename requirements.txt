@@ -4,7 +4,9 @@ torchvision==0.26.*
 lerobot[smolvla]==0.6.1  # transformers>=5.4,<5.6
 onnx
 onnxscript
-onnxruntime
+onnxruntime==1.31.0      # the C++ SDK's version (cpp/scripts/fetch_onnxruntime.sh)
 matplotlib
+pytest==9.*              # tests
+pybind11==3.1.*          # the C++ runtime's Python module
 tensorrt-cu12==10.16.*   # GPU machines only; --extra-index-url https://pypi.nvidia.com
 mujoco                   # env_check rendering test only
