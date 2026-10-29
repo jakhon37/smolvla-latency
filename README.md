@@ -177,7 +177,7 @@ rt->predict_action_chunk(obs, noise, actions);  // noise [1, 50, 32] -> actions 
 
 | Check | Result |
 |---|---|
-| fp32 action chunk vs PyTorch `predict_action_chunk` | max abs 4.8e-7 (gate in the tests: 1e-5) |
+| fp32 action chunk vs PyTorch `predict_action_chunk` | max abs 4.8e-7; 9.5e-7 on the GitHub Actions ubuntu-24.04 runner (gate in the tests: 1e-5) |
 | fp32 and fp16 chunks vs `ort_flow.py`, same inputs | bit-identical |
 | Pipeline stages vs LeRobot: image tokens, prefix K/V, `v_t` over 10 steps | max abs 3.5e-6, 1.1e-6 to 1.2e-6, 1.2e-6 to 1.4e-6; pad mask equal |
 | LeRobot's own `x_t` trajectory through the C++ Euler update | bit-identical at all 10 steps, the last one giving the action chunk |
