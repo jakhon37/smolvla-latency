@@ -17,7 +17,7 @@ The study then:
 - reports latency (p50/p90/p99) and the action-chunk error against fp32;
 - exports the vision encoder to ONNX and TensorRT, checking parity before claiming any speed-up.
 
-Status: tooling complete and smoke-tested offline on CPU. GPU numbers pending.
+Status: tooling complete and smoke-tested offline on CPU. Checked on the CPU with the real `lerobot/smolvla_libero` weights and LIBERO frames: see [Real weights (CPU)](#real-weights-cpu). GPU numbers pending.
 
 ## What the code says before any measurement (LeRobot 0.6.1, transformers 5.5)
 
@@ -117,6 +117,7 @@ $PY tools/dump_bundle.py --policy lerobot/smolvla_libero --out onnx_split/bundle
 
 - `ort_flow.py` is the reference runtime: ONNX Runtime for the graphs, numpy for LeRobot's Euler update, the same noise as PyTorch.
 - With random weights, offline, the fp32 action chunk matches `predict_action_chunk` to 4.8e-7 on the tiny test model and to 7e-7 at SmolVLM2-500M sizes. The tests require 1e-5.
+- With the real `lerobot/smolvla_libero` weights on 16 LIBERO frames, it matches to 6.3e-6, and the fp16 graphs to 2.0e-3. See [Real weights (CPU)](#real-weights-cpu).
 - The tiny test model has two key/value heads (`make_fake_smolvlm.py --tiny --kv-heads 2`). With one, K/V read in the wrong memory layout would be the same numbers and pass every check.
 - `export_split.py` refuses settings the graphs do not reproduce, before it reads any weights where it can: `add_image_special_tokens`, `prefix_length > 0`, an action expert with fewer layers than the VLM, and the others listed in the contract.
 - [docs/SPLIT_GRAPH.md](docs/SPLIT_GRAPH.md) is the contract. It covers:
@@ -196,7 +197,7 @@ Latency on one core (`--threads 1`, pinned to CPU 3, five alternating rounds of 
 
 - ONNX Runtime's graph execution dominates, so on this model C++ and Python are within noise of each other: the rounds spread more than they differ.
 - The C++ runtime's own work per chunk is copying the inputs into its buffers, 2.4 ms for two 512x512 cameras, plus the Euler updates, 0.03 ms. Removing the camera-pixel copy, for example by letting the caller write into the runtime's input buffers, is a known follow-up.
-- The tiny model only shows runtime overhead. The SmolVLM2-500M-sized graphs were not run through the C++ runtime here (disk budget on the test machine), so there is no full-size C++ number.
+- The tiny model only shows runtime overhead. For the full-size graphs with real weights, see [Real weights (CPU)](#real-weights-cpu): there C++ and Python took about the same time, roughly 10 s per chunk on one core.
 
 Control-loop harness: 10k ticks at 50 Hz on the same model (`--threads 1`), with the next chunk requested when 25 actions are left:
 
@@ -219,8 +220,46 @@ Control-loop harness: 10k ticks at 50 Hz on the same model (`--threads 1`), with
 - The real CUDA calls behind `CudaDevice` (`cpp/src/cuda_api.cpp`) were linked against CUDA 12.9's `libcudart`, but only the "no CUDA driver" error path ran.
 - ONNX Runtime's CUDA execution provider: the SDK used here is CPU-only. With it, `OrtGraph` keeps buffers in host memory, so ONNX Runtime copies the prefix K/V to the GPU on every expert step; `TrtGraph` keeps them on the device.
 - The guard against a fused multiply-add in the Euler update (`Contract.EulerUpdateRoundsTheProductSeparately`, for the build's `-ffp-contract=off`) can only fail where the compiler may emit FMA instructions: aarch64, as on Jetson, or x86-64 built with `-march=native` on a CPU that has them. The default x86-64 target has no FMA, so on this VM and on the CI runner the test would pass without the flag too.
-- No GPU latency of any kind, and no real checkpoint weights. The fp16 numbers come from random weights: a checkpoint trained in bf16 can hold activations beyond fp16's range (65504), so check a real checkpoint's fp16 chunk (non-finite values, cosine) before relying on it. In the fp16 `vision` graph the attention scores and softmax are fp16 tensors, because SigLIP's attention does not upcast them as the VLM layers and the expert do, so look there first.
+- No GPU latency of any kind. The numbers in this section come from random weights. Real weights were checked on the CPU only, in [Real weights (CPU)](#real-weights-cpu). There the fp16 `vision` graph's attention scores stayed within ±48. The only overflow, inside the vision tower's GELU, did no harm on ONNX Runtime's CPU provider, nor with every node evaluated in IEEE fp16 (numpy); GPU kernels were not tested.
 - No aarch64 build or run, so nothing on Jetson either: everything here ran on x86-64 with GCC 13. The aarch64 branch of `fetch_onnxruntime.sh` is untested.
+
+## Real weights (CPU)
+
+Every measured number above comes from random weights. This run used the real [`lerobot/smolvla_libero`](https://huggingface.co/lerobot/smolvla_libero) checkpoint and 16 real frames of [`lerobot/libero`](https://huggingface.co/datasets/lerobot/libero), the dataset its training config names: 4 episodes, one task from each LIBERO suite, 4 frames each, both cameras, state and task. Everything went through the checkpoint's own pre- and postprocessors, and each frame got the same noise in every runtime.
+
+CPU only, on a 4-vCPU Xeon VM. Every measurement ran on one core and one thread. The exception is `export_split.py`'s own check, which used ONNX Runtime's default pool of 4 threads on that core.
+- [`results/REAL_WEIGHTS_CPU.md`](results/REAL_WEIGHTS_CPU.md) has the details and [`results/real_weights_cpu.json`](results/real_weights_cpu.json) the numbers.
+- `bash scripts/run_real_weights_cpu.sh PYTHON WORK_DIR` reproduces the run from the Hub. A rerun of its `inputs`, `bundles`, `fp32` and `fp16` steps with the committed tools reproduced those steps' numbers bit for bit, timings aside.
+- The reference is LeRobot's `predict_action_chunk` in fp32. Its actions are 0.07 std from the dataset's demonstrated actions on average over the first 10 steps, against 0.72 for the mean action, so weights and preprocessing are right.
+
+Against that reference, worst case over the 16 frames, in normalised action space (units of each action dimension's std):
+
+| | Max abs | Cosine, smallest | Non-finite |
+|---|---|---|---|
+| Split graphs fp32, `ort_flow.py` and the C++ runtime (same numbers) | 6.3e-6 | 0.9999999999996 | 0 |
+| Split graphs fp16, `ort_flow.py` and the C++ runtime (same numbers) | 2.0e-3 | 0.99999992 | 0 |
+| PyTorch `fp16all`, `fp16vlm`, `amp` (4 of the frames) | 2.9e-3 | 0.99999975 | 0 |
+| PyTorch `lerobot`: bf16, what LeRobot runs for this checkpoint | 4.9e-2 | 0.99995 | 0 |
+| PyTorch `bf16vlm`, `bf16all` | 3.7e-2, 3.2e-2 | 0.99996 | 0 |
+
+`lerobot_amp` fails on the CPU, as expected (`mixed dtype`).
+
+**fp16 is safe for this checkpoint on these frames**, under the two conditions below:
+- **The probe.** Every floating-point intermediate tensor of the three fp16 graphs was made a graph output and read on all 16 frames, each fp16 tensor as it rounds to fp16. One overflowed: the cube `x^3` inside the tanh GELU of the last two SigLIP layers, which the exporter writes out node by node. ONNX Runtime's CPU provider handed the next nodes the fp32 cube. An engine that keeps every node in fp16 overflows the three nodes after the cube too.
+- **The overflow is harmless where it was checked.** tanh saturates. Evaluated node by node in IEEE fp16 (numpy), the formula still returns x or 0, exactly, wherever the cube overflows, and no finite fp16 input gives a non-finite output. On ONNX Runtime's CPU provider the chunk stays finite. GPU kernels were not tested.
+- **The margins.** Outside the GELU, the largest fp16 tensors are the vision residual stream at 663.5 and the VLM residual stream at 7732, 8.5 times below fp16's 65504. Inside the GELU, the nodes after the cube reached 50912 in this run, 1.29 times below, and the cube itself reached 26768 in a layer where it did not overflow. All of these feed tanh. The vision attention scores, the only fp16 ones, stay within ±48.
+- **Condition 1: the fp32 parts stay fp32.** The fp16 graphs are strongly typed and keep some tensors in fp32: the RMSNorm statistics (the VLM's residual stream squared reaches 6.0e7), the VLM's and the expert's attention scores, softmax and masks, RoPE, and the expert's time embedding (values up to 4096). The vision tower's LayerNorm statistics must stay fp32 too (ONNX's default `stash_type`), since its inputs reach 663.5. A runtime has to honour these types.
+- **Condition 2: 16 frames are a small sample.** The margins come from these frames only.
+- **bf16 moves the actions more than fp16.** On the four frames where both ran, LeRobot's own bf16 moved the chunk 4 to 11 times as far as PyTorch's `fp16all`, and up to 15 times as far as `fp16vlm` and 12 as far as `amp`.
+- **The CPU's fp16 chunk is optimistic.** ONNX Runtime's CPU provider computes the fp16 graphs' matrix products in fp32, so its fp16 chunk is likely closer to fp32 than a GPU's. On the same frames it gave 1.2e-3, against 2.9e-3 for PyTorch's `fp16all`, which rounds every fp16 operation's output.
+
+CPU latency on one thread, p50: a chunk takes 9.4 s in PyTorch fp32, 10.1 s with the fp32 split graphs from Python and 9.95 s from C++. bf16 and fp16 are slower on this CPU, which has no arithmetic for either: PyTorch bf16 24.6 s, PyTorch fp16 64.7 s, fp16 graphs 11.2 to 12.1 s. These say nothing about a GPU.
+
+**Not tested:**
+- any GPU, and TensorRT engines;
+- whether TensorRT keeps the LayerNorm statistics and the other fp32-typed tensors in fp32, in particular in a weakly typed build (`trt_vision.py --mode fp16-flag`), where the builder chooses each layer's precision;
+- how TensorRT or a fused GPU GELU kernel treats the GELU's infinite intermediate;
+- other checkpoints, more frames, and closed-loop success.
 
 ## Method notes
 

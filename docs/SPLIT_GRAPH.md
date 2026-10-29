@@ -259,7 +259,7 @@ actions = rt.predict_action_chunk(inputs, noise)   # inputs: pixel_values_<c>, l
 
 Every graph is fed LeRobot's own inputs at its split point, and its output is compared with what LeRobot computed there (max abs; ONNX Runtime 1.31, CPU). The tiny column was measured with 1 and 4 PyTorch threads for the reference and 1 and 4 ONNX Runtime threads; where the PyTorch thread count changes the last digits, it gives the range. The ONNX Runtime thread count changed nothing.
 
-| Check | Tiny | Full size |
+| Check | Tiny (random weights) | Full size (random weights) |
 |---|---|---|
 | Prefix wrapper vs LeRobot prefill, in PyTorch | bit-identical keys, values and mask | not run |
 | Expert wrapper vs `denoise_step`, in PyTorch, 10 steps | 1.2e-6 to 1.4e-6 (the float32 timestep embedding) | not run |
@@ -271,7 +271,7 @@ Every graph is fed LeRobot's own inputs at its split point, and its output is co
 | fp16 action chunk vs LeRobot fp32 | 1.9e-4 to 2.0e-4, cosine 0.9999999974 to 0.9999999978 | 1.0e-3, cosine 0.99999994 |
 | fp16 per graph vs LeRobot fp32: vision, prefix, expert_step | 3.3e-3, 8.5e-4, 5.2e-4 | 9.1e-3, 2.6e-3, 1.3e-3 |
 
-The test asserts each fp32 graph at 1e-4 and the fp32 chunk at 1e-5. fp16 is reported, not asserted tightly, and comes from random weights: a checkpoint trained in bf16 can hold activations beyond fp16's range (65504), so check its fp16 chunk for non-finite values before relying on it. The fp16 `vision` graph's attention scores, fp16 tensors (see [Precision variants](#precision-variants)), are the first place to look.
+The test asserts each fp32 graph at 1e-4 and the fp32 chunk at 1e-5. fp16 is reported, not asserted tightly. The numbers in this table come from random weights; [Real weights (CPU)](#real-weights-cpu) has the same checks with the real `lerobot/smolvla_libero` weights, including whether its activations fit in fp16.
 
 **Full-size graph files**
 
@@ -286,4 +286,50 @@ Inputs and outputs had the shapes in the tables above, with `D = 960`, `Hkv = 5`
 **Not tested here**
 - TensorRT engines built from these graphs; there is no GPU on the test machine.
 - ONNX Runtime's CUDA execution provider.
-- Real checkpoint weights; the Hub is unreachable from the test machine.
+- Real checkpoint weights on a GPU. On the CPU, see the next section.
+
+## Real weights (CPU)
+
+The graphs above were checked with random weights. These checks use the real [`lerobot/smolvla_libero`](https://huggingface.co/lerobot/smolvla_libero) checkpoint on 16 real frames of [`lerobot/libero`](https://huggingface.co/datasets/lerobot/libero), the dataset its training config names.
+- **Inputs.** 4 episodes, one task from each LIBERO suite, 4 frames each. They went through the checkpoint's own preprocessor, which pads the task to 48 tokens, so the graphs saw exactly LeRobot's inputs.
+- **Noise.** Each frame got its own noise, the same in every runtime.
+- **Runtimes.** ONNX Runtime 1.31 CPU on one thread, from `ort_flow.py`'s runtime and from the C++ bench, which gave the same max abs on every frame.
+- **Where the details are.** [`results/REAL_WEIGHTS_CPU.md`](../results/REAL_WEIGHTS_CPU.md) has the details, [`results/real_weights_cpu.json`](../results/real_weights_cpu.json) the numbers, and `scripts/run_real_weights_cpu.sh` reproduces them from the Hub.
+
+Worst case over the 16 frames, against LeRobot's fp32 `predict_action_chunk`. Each graph is fed LeRobot's own inputs at its split point, as in the table above. Action errors are in normalised action space, units of each dimension's std:
+
+| Check | fp32 graphs | fp16 graphs |
+|---|---|---|
+| `vision`, max abs (relative L2); image tokens reach 245 | 3.7e-4 (1.3e-6) | 0.17 (7.8e-4) |
+| `prefix` keys and values | 3.1e-5 (4.1e-7), mask equal | 1.9e-2 (3.7e-4), mask equal |
+| `expert_step`, 10 steps | 1.3e-5 (5.2e-7) | 1.7e-2 (2.5e-4) |
+| Action chunk, max abs and smallest cosine | 6.3e-6, 0.9999999999996 | 2.0e-3, 0.99999992 |
+| Non-finite values in any graph output | 0 | 0 |
+
+**Every tensor's range in fp16.** `tools/real_weights_split.py probe` made every floating-point intermediate tensor of the fp16 graphs a graph output and read all of them on the 16 frames, each as it rounds to fp16. ONNX Runtime's CPU provider still hands a node's fp32 result to the next node where it computes both in fp32, so an overflow does not propagate as it would in an engine that keeps every node in fp16. The probe fails unless it reads every float node output. A rerun with the committed tool read all 516, 1180 and 1227 of them in the fp16 `vision`, `prefix` and `expert_step` graphs (see [Provenance](../results/REAL_WEIGHTS_CPU.md#provenance)).
+
+| Graph | Largest fp16 tensor outside the GELU | Attention scores before softmax |
+|---|---|---|
+| `vision` | 663.5, the residual stream into the last LayerNorm; inside the GELU, see below | fp16, within [-48.0, 44.4] |
+| `prefix` | 7732, the residual stream: 8.5 times below 65504, the tightest margin outside the GELU | fp32, within [-35.5, 31.1] |
+| `expert_step` | 19.1 | fp32, within [-31.8, 45.8] |
+
+- **The GELU overflows, harmlessly where it was checked.** SigLIP's tanh GELU is exported node by node as `x * (0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))))`.
+  - In the last two vision layers its input exceeds |x| = 40.3, where `x^3` overflows fp16. 335 and 115,060 entries of those two cubes were infinite over the 32 camera images.
+  - The next three nodes were computed from the fp32 cube here and stayed finite, but reached up to 50912, 1.29 times below 65504. The cube itself reached 26768 in layer 5, where it did not overflow. In an engine that keeps every node in fp16, those three nodes overflow wherever the cube does.
+  - tanh saturates, so the result is still exactly x or 0. Node by node in IEEE fp16 (numpy), in the exporter's order, the formula gives no non-finite output for any finite fp16 input.
+  - GPU kernels, which may fuse the GELU, were not tested.
+- **The fp32 parts must stay fp32.** The vision LayerNorm inputs reach 663.5, whose square overflows fp16. ONNX's `LayerNormalization` keeps its statistics in fp32 by default (`stash_type` 1), and ONNX Runtime does. The graph itself keeps the rest in fp32 (see [Precision variants](#precision-variants)):
+  - the VLM's RMSNorm statistics (its residual stream squared reaches 6.0e7);
+  - the attention scores, softmax and masks of the VLM and the expert, the masks filled with float32's lowest value;
+  - RoPE;
+  - the expert's time embedding, whose intermediate values reach 4096, where fp16's spacing is 4.
+- **The stored weights fit fp16.** The largest is 12.1, and none becomes infinite.
+- **ONNX Runtime's CPU provider runs these fp16 graphs largely in fp32.** It has no fp16 kernels for most of their nodes. Its profiler shows every MatMul and Gemm on fp32 inputs, with about 195 Cast kernels per graph call. In `vision`, which holds no Cast node, ONNX Runtime inserted all of them; in `prefix` and `expert_step`, most are the graph's own Cast nodes (174 and 166) around the fp32 parts.
+- **A GPU will likely land further from fp32.** A GPU engine that keeps fp16 throughout will likely land further from fp32 than the 2.0e-3 here. PyTorch's `fp16all` rounds the output of every operation in the fp16 layout to fp16 and keeps the same parts in fp32 as these graphs. It gave 2.9e-3 on four of the frames, where these graphs gave 1.2e-3.
+
+Not tested:
+- TensorRT engines built from these graphs, and in particular:
+  - whether they keep the LayerNorm statistics and the other fp32-typed tensors in fp32. A weakly typed build chooses each layer's precision itself.
+  - how they treat the GELU's infinite intermediate.
+- Other checkpoints and more frames.
